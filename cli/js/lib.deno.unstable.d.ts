@@ -988,7 +988,7 @@ declare namespace Deno {
     /** UNSTABLE: new API, yet to be vetted.
      *
      * Sends a message to the target. */
-    send(p: Uint8Array, addr: Addr): Promise<void>;
+    send(p: Uint8Array, addr: Addr): Promise<number>;
     /** UNSTABLE: new API, yet to be vetted.
      *
      * Close closes the socket. Any pending message promises will be rejected
@@ -1245,4 +1245,7 @@ declare namespace Deno {
    *  Requires `allow-env` permission.
    */
   export function hostname(): string;
+
+  /** **UNSTABLE**: The URL of the file that was originally executed from the command-line. */
+  export const mainModule: string;
 }

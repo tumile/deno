@@ -8,7 +8,7 @@ extern crate pty;
 extern crate tempfile;
 
 use futures::prelude::*;
-use std::io::BufRead;
+use std::io::{BufRead, Write};
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -24,6 +24,19 @@ fn std_tests() {
     .arg("--seed=86") // Some tests rely on specific random numbers.
     .arg("-A")
     // .arg("-Ldebug")
+    .spawn()
+    .unwrap()
+    .wait()
+    .unwrap();
+  assert!(status.success());
+}
+
+#[test]
+fn std_lint() {
+  let status = util::deno_cmd()
+    .arg("lint")
+    .arg("--unstable")
+    .arg(util::root_path().join("std"))
     .spawn()
     .unwrap()
     .wait()
@@ -68,6 +81,50 @@ fn eval_p() {
   let stdout_str =
     util::strip_ansi_codes(std::str::from_utf8(&output.stdout).unwrap().trim());
   assert_eq!("3", stdout_str);
+}
+
+#[test]
+
+fn run_from_stdin() {
+  let mut deno = util::deno_cmd()
+    .current_dir(util::root_path())
+    .arg("run")
+    .arg("-")
+    .stdout(std::process::Stdio::piped())
+    .stdin(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+  deno
+    .stdin
+    .as_mut()
+    .unwrap()
+    .write_all(b"console.log(\"Hello World\");")
+    .unwrap();
+  let output = deno.wait_with_output().unwrap();
+  assert!(output.status.success());
+
+  let deno_out = std::str::from_utf8(&output.stdout).unwrap().trim();
+  assert_eq!("Hello World", deno_out);
+
+  let mut deno = util::deno_cmd()
+    .current_dir(util::root_path())
+    .arg("run")
+    .arg("-")
+    .stdout(std::process::Stdio::piped())
+    .stdin(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+  deno
+    .stdin
+    .as_mut()
+    .unwrap()
+    .write_all(b"console.log(\"Bye cached code\");")
+    .unwrap();
+  let output = deno.wait_with_output().unwrap();
+  assert!(output.status.success());
+
+  let deno_out = std::str::from_utf8(&output.stdout).unwrap().trim();
+  assert_eq!("Bye cached code", deno_out);
 }
 
 #[test]
@@ -1215,16 +1272,22 @@ itest!(_026_redirect_javascript {
   http_server: true,
 });
 
+itest!(deno_test {
+  args: "test test_runner_test.ts",
+  exit_code: 1,
+  output: "deno_test.out",
+});
+
 itest!(deno_test_fail_fast {
   args: "test --failfast test_runner_test.ts",
   exit_code: 1,
   output: "deno_test_fail_fast.out",
 });
 
-itest!(deno_test {
-  args: "test test_runner_test.ts",
+itest!(deno_test_only {
+  args: "test deno_test_only.ts",
   exit_code: 1,
-  output: "deno_test.out",
+  output: "deno_test_only.ts.out",
 });
 
 #[test]
@@ -1708,6 +1771,11 @@ itest!(import_meta {
   output: "import_meta.ts.out",
 });
 
+itest!(main_module {
+  args: "run --quiet --unstable --allow-read --reload main_module.ts",
+  output: "main_module.ts.out",
+});
+
 itest!(lib_ref {
   args: "run --quiet --unstable --reload lib_ref.ts",
   output: "lib_ref.ts.out",
@@ -1727,6 +1795,12 @@ itest!(seed_random {
 itest!(type_definitions {
   args: "run --reload type_definitions.ts",
   output: "type_definitions.ts.out",
+});
+
+itest!(type_definitions_for_export {
+  args: "run --reload type_definitions_for_export.ts",
+  output: "type_definitions_for_export.ts.out",
+  exit_code: 1,
 });
 
 itest!(type_directives_01 {
@@ -1815,6 +1889,12 @@ itest!(wasm {
 itest!(wasm_async {
   args: "run wasm_async.js",
   output: "wasm_async.out",
+});
+
+itest!(wasm_unreachable {
+  args: "run wasm_unreachable.js",
+  output: "wasm_unreachable.out",
+  exit_code: 1,
 });
 
 itest!(top_level_await {
@@ -1932,11 +2012,34 @@ itest!(cjs_imports {
 itest!(ts_import_from_js {
   args: "run --quiet --reload ts_import_from_js.js",
   output: "ts_import_from_js.js.out",
+  http_server: true,
+});
+
+itest!(jsx_import_from_ts {
+  args: "run --quiet --reload jsx_import_from_ts.ts",
+  output: "jsx_import_from_ts.ts.out",
+});
+
+itest!(single_compile_with_reload {
+  args: "run --reload --allow-read single_compile_with_reload.ts",
+  output: "single_compile_with_reload.ts.out",
 });
 
 itest!(proto_exploit {
   args: "run proto_exploit.js",
   output: "proto_exploit.js.out",
+});
+
+itest!(deno_lint {
+  args: "lint --unstable lint/file1.js lint/file2.ts lint/ignored_file.ts",
+  output: "lint/expected.out",
+  exit_code: 1,
+});
+
+itest!(deno_lint_glob {
+  args: "lint --unstable lint/",
+  output: "lint/expected_glob.out",
+  exit_code: 1,
 });
 
 #[test]

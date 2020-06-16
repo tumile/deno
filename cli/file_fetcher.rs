@@ -64,7 +64,7 @@ const SUPPORTED_URL_SCHEMES: [&str; 3] = ["http", "https", "file"];
 #[derive(Clone)]
 pub struct SourceFileFetcher {
   source_file_cache: SourceFileCache,
-  cache_blacklist: Vec<String>,
+  cache_blocklist: Vec<String>,
   use_disk_cache: bool,
   no_remote: bool,
   cached_only: bool,
@@ -77,7 +77,7 @@ impl SourceFileFetcher {
   pub fn new(
     http_cache: HttpCache,
     use_disk_cache: bool,
-    cache_blacklist: Vec<String>,
+    cache_blocklist: Vec<String>,
     no_remote: bool,
     cached_only: bool,
     ca_file: Option<String>,
@@ -85,7 +85,7 @@ impl SourceFileFetcher {
     let file_fetcher = Self {
       http_cache,
       source_file_cache: SourceFileCache::default(),
-      cache_blacklist,
+      cache_blocklist,
       use_disk_cache,
       no_remote,
       cached_only,
@@ -154,7 +154,11 @@ impl SourceFileFetcher {
     permissions: Permissions,
   ) -> Result<SourceFile, ErrBox> {
     let module_url = specifier.as_url().to_owned();
-    debug!("fetch_source_file specifier: {} ", &module_url);
+    debug!(
+      "fetch_source_file specifier: {} maybe_referrer: {:#?}",
+      &module_url,
+      maybe_referrer.as_ref()
+    );
 
     // Check if this file was already fetched and can be retrieved from in-process cache.
     let maybe_cached_file = self.source_file_cache.get(specifier.to_string());
@@ -238,7 +242,7 @@ impl SourceFileFetcher {
       return self.fetch_local_file(&module_url, permissions).map(Some);
     }
 
-    self.fetch_cached_remote_source(&module_url)
+    self.fetch_cached_remote_source(&module_url, 10)
   }
 
   /// This is main method that is responsible for fetching local or remote files.
@@ -343,7 +347,13 @@ impl SourceFileFetcher {
   fn fetch_cached_remote_source(
     &self,
     module_url: &Url,
+    redirect_limit: i64,
   ) -> Result<Option<SourceFile>, ErrBox> {
+    if redirect_limit < 0 {
+      let e = OpError::http("too many redirects".to_string());
+      return Err(e.into());
+    }
+
     let result = self.http_cache.get(&module_url);
     let result = match result {
       Err(e) => {
@@ -370,7 +380,8 @@ impl SourceFileFetcher {
           return Err(e.into());
         }
       };
-      return self.fetch_cached_remote_source(&redirect_url);
+      return self
+        .fetch_cached_remote_source(&redirect_url, redirect_limit - 1);
     }
 
     let mut source_code = Vec::new();
@@ -422,11 +433,11 @@ impl SourceFileFetcher {
       return futures::future::err(e.into()).boxed_local();
     }
 
-    let is_blacklisted =
-      check_cache_blacklist(module_url, self.cache_blacklist.as_ref());
+    let is_blocked =
+      check_cache_blocklist(module_url, self.cache_blocklist.as_ref());
     // First try local cache
-    if use_disk_cache && !is_blacklisted {
-      match self.fetch_cached_remote_source(&module_url) {
+    if use_disk_cache && !is_blocked {
+      match self.fetch_cached_remote_source(&module_url, redirect_limit) {
         Ok(Some(source_file)) => {
           return futures::future::ok(source_file).boxed_local();
         }
@@ -475,7 +486,7 @@ impl SourceFileFetcher {
       {
         FetchOnceResult::NotModified => {
           let source_file =
-            dir.fetch_cached_remote_source(&module_url)?.unwrap();
+            dir.fetch_cached_remote_source(&module_url, 10)?.unwrap();
 
           Ok(source_file)
         }
@@ -651,7 +662,7 @@ fn filter_shebang(bytes: Vec<u8>) -> Vec<u8> {
   }
 }
 
-fn check_cache_blacklist(url: &Url, black_list: &[String]) -> bool {
+fn check_cache_blocklist(url: &Url, black_list: &[String]) -> bool {
   let mut url_without_fragmets = url.clone();
   url_without_fragmets.set_fragment(None);
   if black_list.contains(&String::from(url_without_fragmets.as_str())) {
@@ -721,7 +732,7 @@ mod tests {
   }
 
   #[test]
-  fn test_cache_blacklist() {
+  fn test_cache_blocklist() {
     let args = crate::flags::resolve_urls(vec![
       String::from("http://deno.land/std"),
       String::from("http://github.com/example/mod.ts"),
@@ -731,52 +742,52 @@ mod tests {
     ]);
 
     let u: Url = "http://deno.land/std/fs/mod.ts".parse().unwrap();
-    assert_eq!(check_cache_blacklist(&u, &args), true);
+    assert_eq!(check_cache_blocklist(&u, &args), true);
 
     let u: Url = "http://github.com/example/file.ts".parse().unwrap();
-    assert_eq!(check_cache_blacklist(&u, &args), false);
+    assert_eq!(check_cache_blocklist(&u, &args), false);
 
     let u: Url = "http://github.com/example/mod.ts".parse().unwrap();
-    assert_eq!(check_cache_blacklist(&u, &args), true);
+    assert_eq!(check_cache_blocklist(&u, &args), true);
 
     let u: Url = "http://github.com/example/mod.ts?foo=bar".parse().unwrap();
-    assert_eq!(check_cache_blacklist(&u, &args), true);
+    assert_eq!(check_cache_blocklist(&u, &args), true);
 
     let u: Url = "http://github.com/example/mod.ts#fragment".parse().unwrap();
-    assert_eq!(check_cache_blacklist(&u, &args), true);
+    assert_eq!(check_cache_blocklist(&u, &args), true);
 
     let u: Url = "http://fragment.com/mod.ts".parse().unwrap();
-    assert_eq!(check_cache_blacklist(&u, &args), true);
+    assert_eq!(check_cache_blocklist(&u, &args), true);
 
     let u: Url = "http://query.com/mod.ts".parse().unwrap();
-    assert_eq!(check_cache_blacklist(&u, &args), false);
+    assert_eq!(check_cache_blocklist(&u, &args), false);
 
     let u: Url = "http://fragment.com/mod.ts#fragment".parse().unwrap();
-    assert_eq!(check_cache_blacklist(&u, &args), true);
+    assert_eq!(check_cache_blocklist(&u, &args), true);
 
     let u: Url = "http://query.com/mod.ts?foo=bar".parse().unwrap();
-    assert_eq!(check_cache_blacklist(&u, &args), true);
+    assert_eq!(check_cache_blocklist(&u, &args), true);
 
     let u: Url = "http://queryandfragment.com/mod.ts".parse().unwrap();
-    assert_eq!(check_cache_blacklist(&u, &args), false);
+    assert_eq!(check_cache_blocklist(&u, &args), false);
 
     let u: Url = "http://queryandfragment.com/mod.ts?foo=bar"
       .parse()
       .unwrap();
-    assert_eq!(check_cache_blacklist(&u, &args), true);
+    assert_eq!(check_cache_blocklist(&u, &args), true);
 
     let u: Url = "http://queryandfragment.com/mod.ts#fragment"
       .parse()
       .unwrap();
-    assert_eq!(check_cache_blacklist(&u, &args), false);
+    assert_eq!(check_cache_blocklist(&u, &args), false);
 
     let u: Url = "http://query.com/mod.ts?foo=bar#fragment".parse().unwrap();
-    assert_eq!(check_cache_blacklist(&u, &args), true);
+    assert_eq!(check_cache_blocklist(&u, &args), true);
 
     let u: Url = "http://fragment.com/mod.ts?foo=bar#fragment"
       .parse()
       .unwrap();
-    assert_eq!(check_cache_blacklist(&u, &args), true);
+    assert_eq!(check_cache_blocklist(&u, &args), true);
   }
 
   #[test]
@@ -1248,9 +1259,13 @@ mod tests {
       )
       .await;
     assert!(result.is_err());
-    // FIXME(bartlomieju):
-    // let err = result.err().unwrap();
-    // assert_eq!(err.kind(), ErrorKind::Http);
+
+    // Test that redirections in cached files are limited as well
+    let result = fetcher.fetch_cached_remote_source(&double_redirect_url, 2);
+    assert!(result.is_ok());
+
+    let result = fetcher.fetch_cached_remote_source(&double_redirect_url, 1);
+    assert!(result.is_err());
 
     drop(http_server_guard);
   }
@@ -1416,7 +1431,7 @@ mod tests {
       .insert("content-type".to_string(), "text/javascript".to_string());
     metadata.write(&cache_filename).unwrap();
 
-    let result2 = fetcher.fetch_cached_remote_source(&module_url);
+    let result2 = fetcher.fetch_cached_remote_source(&module_url, 1);
     assert!(result2.is_ok());
     let r2 = result2.unwrap().unwrap();
     assert_eq!(r2.source_code, b"export const loaded = true;\n");

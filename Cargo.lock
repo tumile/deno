@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "deno"
-version = "1.0.5"
+version = "1.1.0"
 dependencies = [
  "atty",
  "base64 0.12.1",
@@ -451,7 +451,6 @@ dependencies = [
  "dprint-plugin-typescript",
  "futures 0.3.5",
  "fwdansi",
- "glob",
  "http",
  "indexmap",
  "lazy_static",
@@ -490,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "deno_core"
-version = "0.47.1"
+version = "0.48.0"
 dependencies = [
  "derive_deref",
  "downcast-rs",
@@ -506,9 +505,9 @@ dependencies = [
 
 [[package]]
 name = "deno_lint"
-version = "0.1.7"
+version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77a3ec96c92609aa121d085f3a1351d3836e55b78a4b8ce79ea771c2ad9bd80b"
+checksum = "dc10bb331262fd598e6925ab8b59f72b01cc9c3a5a818ce7d57652e4b23fe45a"
 dependencies = [
  "lazy_static",
  "regex",
@@ -521,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "deno_typescript"
-version = "0.47.1"
+version = "0.48.0"
 dependencies = [
  "deno_core",
  "serde",
@@ -918,12 +917,6 @@ name = "gimli"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bcc8e0c9bce37868955864dbecd2b1ab2bdf967e6f28066d65aaac620444b65c"
-
-[[package]]
-name = "glob"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b919933a397b79c37e33b77bb2aa3dc8eb6e165ad809e58ff75bc7db2e34574"
 
 [[package]]
 name = "h2"

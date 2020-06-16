@@ -42,6 +42,7 @@ mod import_map;
 mod inspector;
 pub mod installer;
 mod js;
+mod lint;
 mod lockfile;
 mod metrics;
 mod module_graph;
@@ -91,6 +92,7 @@ use log::Level;
 use log::Metadata;
 use log::Record;
 use std::env;
+use std::io::Read;
 use std::io::Write;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -314,14 +316,18 @@ async fn install_command(
     .map_err(ErrBox::from)
 }
 
-async fn lint_command(flags: Flags, files: Vec<String>) -> Result<(), ErrBox> {
+async fn lint_command(
+  flags: Flags,
+  files: Vec<String>,
+  list_rules: bool,
+) -> Result<(), ErrBox> {
   let global_state = GlobalState::new(flags)?;
 
   // TODO(bartlomieju): refactor, it's non-sense to create
   // state just to perform unstable check...
   use crate::state::State;
   let state = State::new(
-    global_state.clone(),
+    global_state,
     None,
     ModuleSpecifier::resolve_url("file:///dummy.ts").unwrap(),
     None,
@@ -330,53 +336,12 @@ async fn lint_command(flags: Flags, files: Vec<String>) -> Result<(), ErrBox> {
 
   state.check_unstable("lint");
 
-  let mut error_counts = 0;
-
-  for file in files {
-    let specifier = ModuleSpecifier::resolve_url_or_path(&file)?;
-    let source_file = global_state
-      .file_fetcher
-      .fetch_source_file(&specifier, None, Permissions::allow_all())
-      .await?;
-    let source_code = String::from_utf8(source_file.source_code)?;
-
-    let mut linter = deno_lint::linter::Linter::default();
-    let lint_rules = deno_lint::rules::get_all_rules();
-
-    let file_diagnostics = linter.lint(file, source_code, lint_rules)?;
-
-    error_counts += file_diagnostics.len();
-    for d in file_diagnostics.iter() {
-      let pretty_message = format!(
-        "({}) {}",
-        colors::gray(d.code.to_string()),
-        d.message.clone()
-      );
-      eprintln!(
-        "{}\n",
-        fmt_errors::format_stack(
-          true,
-          pretty_message,
-          Some(d.line_src.clone()),
-          Some(d.location.col as i64),
-          Some((d.location.col + d.snippet_length) as i64),
-          &[fmt_errors::format_location(
-            d.location.filename.clone(),
-            d.location.line as i64,
-            d.location.col as i64,
-          )],
-          0
-        )
-      );
-    }
+  if list_rules {
+    lint::print_rules_list();
+    return Ok(());
   }
 
-  if error_counts > 0 {
-    eprintln!("Found {} problems", error_counts);
-    std::process::exit(1);
-  }
-
-  Ok(())
+  lint::lint_files(files).await
 }
 
 async fn cache_command(flags: Flags, files: Vec<String>) -> Result<(), ErrBox> {
@@ -609,9 +574,36 @@ async fn run_repl(flags: Flags) -> Result<(), ErrBox> {
 
 async fn run_command(flags: Flags, script: String) -> Result<(), ErrBox> {
   let global_state = GlobalState::new(flags.clone())?;
-  let main_module = ModuleSpecifier::resolve_url_or_path(&script).unwrap();
+  let main_module = if script != "-" {
+    ModuleSpecifier::resolve_url_or_path(&script).unwrap()
+  } else {
+    ModuleSpecifier::resolve_url_or_path("./__$deno$stdin.ts").unwrap()
+  };
   let mut worker =
     MainWorker::create(global_state.clone(), main_module.clone())?;
+  if script == "-" {
+    let mut source = Vec::new();
+    std::io::stdin().read_to_end(&mut source)?;
+    let main_module_url = main_module.as_url().to_owned();
+    // Create a dummy source file.
+    let source_file = SourceFile {
+      filename: main_module_url.to_file_path().unwrap(),
+      url: main_module_url,
+      types_url: None,
+      types_header: None,
+      media_type: MediaType::TypeScript,
+      source_code: source,
+    };
+    // Save our fake file into file fetcher cache
+    // to allow module access by TS compiler (e.g. op_fetch_source_files)
+    worker
+      .state
+      .borrow()
+      .global_state
+      .file_fetcher
+      .save_source_file_in_cache(&main_module, source_file);
+  };
+
   debug!("main_module {}", main_module);
   worker.execute_module(&main_module).await?;
   write_lockfile(global_state)?;
@@ -726,7 +718,9 @@ pub fn main() {
     } => {
       install_command(flags, module_url, args, name, root, force).boxed_local()
     }
-    DenoSubcommand::Lint { files } => lint_command(flags, files).boxed_local(),
+    DenoSubcommand::Lint { files, rules } => {
+      lint_command(flags, files, rules).boxed_local()
+    }
     DenoSubcommand::Repl => run_repl(flags).boxed_local(),
     DenoSubcommand::Run { script } => run_command(flags, script).boxed_local(),
     DenoSubcommand::Test {
