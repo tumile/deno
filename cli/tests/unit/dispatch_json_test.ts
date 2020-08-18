@@ -2,10 +2,10 @@ import { assert, unitTest, assertMatch, unreachable } from "./test_util.ts";
 
 const openErrorStackPattern = new RegExp(
   `^.*
-    at unwrapResponse \\(.*dispatch_json\\.ts:.*\\)
-    at Object.sendAsync \\(.*dispatch_json\\.ts:.*\\)
-    at async Object\\.open \\(.*files\\.ts:.*\\).*$`,
-  "ms"
+    at unwrapResponse \\(.*dispatch_json\\.js:.*\\)
+    at sendAsync \\(.*dispatch_json\\.js:.*\\)
+    at async Object\\.open \\(.*files\\.js:.*\\).*$`,
+  "ms",
 );
 
 unitTest(
@@ -16,16 +16,16 @@ unitTest(
       .catch((error): void => {
         assertMatch(error.stack, openErrorStackPattern);
       });
-  }
+  },
 );
 
-/* eslint-disable @typescript-eslint/no-namespace, @typescript-eslint/no-explicit-any,no-var */
 declare global {
+  // eslint-disable-next-line @typescript-eslint/no-namespace
   namespace Deno {
-    var core: any;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    var core: any; // eslint-disable-line no-var
   }
 }
-/* eslint-enable */
 
 unitTest(function malformedJsonControlBuffer(): void {
   const opId = Deno.core.ops()["op_open"];

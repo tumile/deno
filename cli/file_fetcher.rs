@@ -7,11 +7,12 @@ use crate::http_util::FetchOnceResult;
 use crate::msg;
 use crate::op_error::OpError;
 use crate::permissions::Permissions;
+use crate::text_encoding;
 use deno_core::ErrBox;
 use deno_core::ModuleSpecifier;
 use futures::future::FutureExt;
 use log::info;
-use regex::Regex;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::future::Future;
@@ -25,6 +26,47 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use url::Url;
 
+/// Structure representing a text document.
+#[derive(Debug, Clone)]
+pub struct TextDocument {
+  bytes: Vec<u8>,
+  charset: Cow<'static, str>,
+}
+
+impl TextDocument {
+  pub fn new(
+    bytes: Vec<u8>,
+    charset: Option<impl Into<Cow<'static, str>>>,
+  ) -> TextDocument {
+    let charset = charset
+      .map(|cs| cs.into())
+      .unwrap_or_else(|| text_encoding::detect_charset(&bytes).into());
+    TextDocument { bytes, charset }
+  }
+
+  pub fn as_bytes(&self) -> &Vec<u8> {
+    &self.bytes
+  }
+
+  pub fn into_bytes(self) -> Vec<u8> {
+    self.bytes
+  }
+
+  pub fn to_str(&self) -> Result<Cow<str>, std::io::Error> {
+    text_encoding::convert_to_utf8(&self.bytes, &self.charset)
+  }
+
+  pub fn to_string(&self) -> Result<String, std::io::Error> {
+    self.to_str().map(String::from)
+  }
+}
+
+impl From<Vec<u8>> for TextDocument {
+  fn from(bytes: Vec<u8>) -> Self {
+    TextDocument::new(bytes, Option::<&str>::None)
+  }
+}
+
 /// Structure representing local or remote file.
 ///
 /// In case of remote file `url` might be different than originally requested URL, if so
@@ -33,10 +75,9 @@ use url::Url;
 pub struct SourceFile {
   pub url: Url,
   pub filename: PathBuf,
-  pub types_url: Option<Url>,
   pub types_header: Option<String>,
   pub media_type: msg::MediaType,
-  pub source_code: Vec<u8>,
+  pub source_code: TextDocument,
 }
 
 /// Simple struct implementing in-process caching to prevent multiple
@@ -182,8 +223,9 @@ impl SourceFileFetcher {
     match result {
       Ok(mut file) => {
         // TODO: move somewhere?
-        if file.source_code.starts_with(b"#!") {
-          file.source_code = filter_shebang(file.source_code);
+        if file.source_code.bytes.starts_with(b"#!") {
+          file.source_code =
+            filter_shebang(&file.source_code.to_str().unwrap()[..]).into();
         }
 
         // Cache in-process for subsequent access.
@@ -315,19 +357,12 @@ impl SourceFileFetcher {
       Err(e) => return Err(e.into()),
     };
 
-    let media_type = map_content_type(&filepath, None);
-    let types_url = match media_type {
-      msg::MediaType::JavaScript | msg::MediaType::JSX => {
-        get_types_url(&module_url, &source_code, None)
-      }
-      _ => None,
-    };
+    let (media_type, charset) = map_content_type(&filepath, None);
     Ok(SourceFile {
       url: module_url.clone(),
       filename: filepath,
       media_type,
-      source_code,
-      types_url,
+      source_code: TextDocument::new(source_code, charset),
       types_header: None,
     })
   }
@@ -389,25 +424,16 @@ impl SourceFileFetcher {
 
     let cache_filename = self.http_cache.get_cache_filename(module_url);
     let fake_filepath = PathBuf::from(module_url.path());
-    let media_type = map_content_type(
+    let (media_type, charset) = map_content_type(
       &fake_filepath,
       headers.get("content-type").map(|e| e.as_str()),
     );
     let types_header = headers.get("x-typescript-types").map(|e| e.to_string());
-    let types_url = match media_type {
-      msg::MediaType::JavaScript | msg::MediaType::JSX => get_types_url(
-        &module_url,
-        &source_code,
-        headers.get("x-typescript-types").map(|e| e.as_str()),
-      ),
-      _ => None,
-    };
     Ok(Some(SourceFile {
       url: module_url.clone(),
       filename: cache_filename,
       media_type,
-      source_code,
-      types_url,
+      source_code: TextDocument::new(source_code, charset),
       types_header,
     }))
   }
@@ -466,11 +492,7 @@ impl SourceFileFetcher {
       .boxed_local();
     }
 
-    info!(
-      "{} {}",
-      colors::green("Download".to_string()),
-      module_url.to_string()
-    );
+    info!("{} {}", colors::green("Download"), module_url.to_string());
 
     let dir = self.clone();
     let module_url = module_url.clone();
@@ -512,28 +534,19 @@ impl SourceFileFetcher {
           let cache_filepath = dir.http_cache.get_cache_filename(&module_url);
           // Used to sniff out content type from file extension - probably to be removed
           let fake_filepath = PathBuf::from(module_url.path());
-          let media_type = map_content_type(
+          let (media_type, charset) = map_content_type(
             &fake_filepath,
             headers.get("content-type").map(String::as_str),
           );
 
           let types_header =
             headers.get("x-typescript-types").map(String::to_string);
-          let types_url = match media_type {
-            msg::MediaType::JavaScript | msg::MediaType::JSX => get_types_url(
-              &module_url,
-              &source,
-              headers.get("x-typescript-types").map(String::as_str),
-            ),
-            _ => None,
-          };
 
           let source_file = SourceFile {
             url: module_url.clone(),
             filename: cache_filepath,
             media_type,
-            source_code: source,
-            types_url,
+            source_code: TextDocument::new(source, charset),
             types_header,
           };
 
@@ -563,16 +576,19 @@ pub fn map_file_extension(path: &Path) -> msg::MediaType {
   }
 }
 
-// convert a ContentType string into a enumerated MediaType
-fn map_content_type(path: &Path, content_type: Option<&str>) -> msg::MediaType {
+// convert a ContentType string into a enumerated MediaType + optional charset
+fn map_content_type(
+  path: &Path,
+  content_type: Option<&str>,
+) -> (msg::MediaType, Option<String>) {
   match content_type {
     Some(content_type) => {
-      // sometimes there is additional data after the media type in
+      // Sometimes there is additional data after the media type in
       // Content-Type so we have to do a bit of manipulation so we are only
-      // dealing with the actual media type
-      let ct_vector: Vec<&str> = content_type.split(';').collect();
-      let ct: &str = ct_vector.first().unwrap();
-      match ct.to_lowercase().as_ref() {
+      // dealing with the actual media type.
+      let mut ct_iter = content_type.split(';');
+      let ct = ct_iter.next().unwrap();
+      let media_type = match ct.to_lowercase().as_ref() {
         "application/typescript"
         | "text/typescript"
         | "video/vnd.dlna.mpeg-tts"
@@ -596,9 +612,16 @@ fn map_content_type(path: &Path, content_type: Option<&str>) -> msg::MediaType {
           debug!("unknown content type: {}", content_type);
           msg::MediaType::Unknown
         }
-      }
+      };
+
+      let charset = ct_iter
+        .map(str::trim)
+        .find_map(|s| s.strip_prefix("charset="))
+        .map(String::from);
+
+      (media_type, charset)
     }
-    None => map_file_extension(path),
+    None => (map_file_extension(path), None),
   }
 }
 
@@ -617,43 +640,7 @@ fn map_js_like_extension(
   }
 }
 
-/// Take a module URL and source code and determines if the source code contains
-/// a type directive, and if so, returns the parsed URL for that type directive.
-fn get_types_url(
-  module_url: &Url,
-  source_code: &[u8],
-  maybe_types_header: Option<&str>,
-) -> Option<Url> {
-  lazy_static! {
-    /// Matches reference type directives in strings, which provide
-    /// type files that should be used by the compiler instead of the
-    /// JavaScript file.
-    static ref DIRECTIVE_TYPES: Regex = Regex::new(
-      r#"(?m)^/{3}\s*<reference\s+types\s*=\s*["']([^"']+)["']\s*/>"#
-    )
-    .unwrap();
-  }
-
-  match maybe_types_header {
-    Some(types_header) => match Url::parse(&types_header) {
-      Ok(url) => Some(url),
-      _ => Some(module_url.join(&types_header).unwrap()),
-    },
-    _ => match DIRECTIVE_TYPES.captures(str::from_utf8(source_code).unwrap()) {
-      Some(cap) => {
-        let val = cap.get(1).unwrap().as_str();
-        match Url::parse(&val) {
-          Ok(url) => Some(url),
-          _ => Some(module_url.join(&val).unwrap()),
-        }
-      }
-      _ => None,
-    },
-  }
-}
-
-fn filter_shebang(bytes: Vec<u8>) -> Vec<u8> {
-  let string = str::from_utf8(&bytes).unwrap();
+fn filter_shebang(string: &str) -> Vec<u8> {
   if let Some(i) = string.find('\n') {
     let (_, rest) = string.split_at(i);
     rest.as_bytes().to_owned()
@@ -810,7 +797,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_get_source_code_1() {
-    let http_server_guard = crate::test_util::http_server();
+    let _http_server_guard = test_util::http_server();
     let (temp_dir, fetcher) = test_setup();
     let fetcher_1 = fetcher.clone();
     let fetcher_2 = fetcher.clone();
@@ -833,7 +820,7 @@ mod tests {
     assert!(result.is_ok());
     let r = result.unwrap();
     assert_eq!(
-      r.source_code,
+      r.source_code.bytes,
       &b"export { printHello } from \"./print_hello.ts\";\n"[..]
     );
     assert_eq!(&(r.media_type), &msg::MediaType::TypeScript);
@@ -860,7 +847,7 @@ mod tests {
     assert!(result2.is_ok());
     let r2 = result2.unwrap();
     assert_eq!(
-      r2.source_code,
+      r2.source_code.bytes,
       &b"export { printHello } from \"./print_hello.ts\";\n"[..]
     );
     // If get_source_file does not call remote, this should be JavaScript
@@ -889,7 +876,7 @@ mod tests {
     assert!(result3.is_ok());
     let r3 = result3.unwrap();
     assert_eq!(
-      r3.source_code,
+      r3.source_code.bytes,
       &b"export { printHello } from \"./print_hello.ts\";\n"[..]
     );
     // If get_source_file does not call remote, this should be JavaScript
@@ -916,16 +903,14 @@ mod tests {
     assert!(result4.is_ok());
     let r4 = result4.unwrap();
     let expected4 = &b"export { printHello } from \"./print_hello.ts\";\n"[..];
-    assert_eq!(r4.source_code, expected4);
+    assert_eq!(r4.source_code.bytes, expected4);
     // Resolved back to TypeScript
     assert_eq!(&(r4.media_type), &msg::MediaType::TypeScript);
-
-    drop(http_server_guard);
   }
 
   #[tokio::test]
   async fn test_get_source_code_2() {
-    let http_server_guard = crate::test_util::http_server();
+    let _http_server_guard = test_util::http_server();
     let (temp_dir, fetcher) = test_setup();
     let module_url =
       Url::parse("http://localhost:4545/cli/tests/subdir/mismatch_ext.ts")
@@ -946,7 +931,7 @@ mod tests {
     assert!(result.is_ok());
     let r = result.unwrap();
     let expected = b"export const loaded = true;\n";
-    assert_eq!(r.source_code, expected);
+    assert_eq!(r.source_code.bytes, expected);
     assert_eq!(&(r.media_type), &msg::MediaType::JavaScript);
     let (_, headers) = fetcher.http_cache.get(&module_url).unwrap();
     assert_eq!(headers.get("content-type").unwrap(), "text/javascript");
@@ -972,7 +957,7 @@ mod tests {
     assert!(result2.is_ok());
     let r2 = result2.unwrap();
     let expected2 = b"export const loaded = true;\n";
-    assert_eq!(r2.source_code, expected2);
+    assert_eq!(r2.source_code.bytes, expected2);
     // If get_source_file does not call remote, this should be TypeScript
     // as we modified before! (we do not overwrite .headers.json due to no http
     // fetch)
@@ -998,19 +983,17 @@ mod tests {
     assert!(result3.is_ok());
     let r3 = result3.unwrap();
     let expected3 = b"export const loaded = true;\n";
-    assert_eq!(r3.source_code, expected3);
+    assert_eq!(r3.source_code.bytes, expected3);
     // Now the old .headers.json file should be overwritten back to JavaScript!
     // (due to http fetch)
     assert_eq!(&(r3.media_type), &msg::MediaType::JavaScript);
     let (_, headers) = fetcher.http_cache.get(&module_url).unwrap();
     assert_eq!(headers.get("content-type").unwrap(), "text/javascript");
-
-    drop(http_server_guard);
   }
 
   #[tokio::test]
   async fn test_get_source_code_multiple_downloads_of_same_file() {
-    let http_server_guard = crate::test_util::http_server();
+    let _http_server_guard = test_util::http_server();
     let (_temp_dir, fetcher) = test_setup();
     let specifier = ModuleSpecifier::resolve_url(
       "http://localhost:4545/cli/tests/subdir/mismatch_ext.ts",
@@ -1051,12 +1034,11 @@ mod tests {
     let headers_file_modified_2 = headers_file_metadata_2.modified().unwrap();
 
     assert_eq!(headers_file_modified, headers_file_modified_2);
-    drop(http_server_guard);
   }
 
   #[tokio::test]
   async fn test_get_source_code_3() {
-    let http_server_guard = crate::test_util::http_server();
+    let _http_server_guard = test_util::http_server();
     let (_temp_dir, fetcher) = test_setup();
 
     let redirect_module_url = Url::parse(
@@ -1104,13 +1086,11 @@ mod tests {
     assert!(headers.get("location").is_none());
     // Examine the meta result.
     assert_eq!(mod_meta.url, target_module_url);
-
-    drop(http_server_guard);
   }
 
   #[tokio::test]
   async fn test_get_source_code_4() {
-    let http_server_guard = crate::test_util::http_server();
+    let _http_server_guard = test_util::http_server();
     let (_temp_dir, fetcher) = test_setup();
     let double_redirect_url = Url::parse(
       "http://localhost:4548/cli/tests/subdir/redirects/redirect1.js",
@@ -1162,13 +1142,11 @@ mod tests {
 
     // Examine the meta result.
     assert_eq!(mod_meta.url, target_url);
-
-    drop(http_server_guard);
   }
 
   #[tokio::test]
   async fn test_get_source_code_5() {
-    let http_server_guard = crate::test_util::http_server();
+    let _http_server_guard = test_util::http_server();
     let (_temp_dir, fetcher) = test_setup();
 
     let double_redirect_url = Url::parse(
@@ -1224,13 +1202,11 @@ mod tests {
     let file_modified_2 = file_metadata_2.modified().unwrap();
 
     assert_eq!(file_modified, file_modified_2);
-
-    drop(http_server_guard);
   }
 
   #[tokio::test]
   async fn test_get_source_code_6() {
-    let http_server_guard = crate::test_util::http_server();
+    let _http_server_guard = test_util::http_server();
     let (_temp_dir, fetcher) = test_setup();
     let double_redirect_url = Url::parse(
       "http://localhost:4548/cli/tests/subdir/redirects/redirect1.js",
@@ -1266,13 +1242,11 @@ mod tests {
 
     let result = fetcher.fetch_cached_remote_source(&double_redirect_url, 1);
     assert!(result.is_err());
-
-    drop(http_server_guard);
   }
 
   #[tokio::test]
   async fn test_get_source_code_7() {
-    let http_server_guard = crate::test_util::http_server();
+    let _http_server_guard = test_util::http_server();
     let (_temp_dir, fetcher) = test_setup();
 
     // Testing redirect with Location set to absolute url.
@@ -1321,13 +1295,11 @@ mod tests {
     assert!(headers.get("location").is_none());
     // Examine the meta result.
     assert_eq!(mod_meta.url, target_module_url);
-
-    drop(http_server_guard);
   }
 
   #[tokio::test]
   async fn test_get_source_no_remote() {
-    let http_server_guard = crate::test_util::http_server();
+    let _http_server_guard = test_util::http_server();
     let (_temp_dir, fetcher) = test_setup();
     let module_url =
       Url::parse("http://localhost:4545/cli/tests/002_hello.ts").unwrap();
@@ -1345,13 +1317,11 @@ mod tests {
     // FIXME(bartlomieju):
     // let err = result.err().unwrap();
     // assert_eq!(err.kind(), ErrorKind::NotFound);
-
-    drop(http_server_guard);
   }
 
   #[tokio::test]
   async fn test_get_source_cached_only() {
-    let http_server_guard = crate::test_util::http_server();
+    let _http_server_guard = test_util::http_server();
     let (_temp_dir, fetcher) = test_setup();
     let fetcher_1 = fetcher.clone();
     let fetcher_2 = fetcher.clone();
@@ -1397,12 +1367,11 @@ mod tests {
       )
       .await;
     assert!(result.is_ok());
-    drop(http_server_guard);
   }
 
   #[tokio::test]
   async fn test_fetch_source_0() {
-    let http_server_guard = crate::test_util::http_server();
+    let _http_server_guard = test_util::http_server();
     let (_temp_dir, fetcher) = test_setup();
     let module_url =
       Url::parse("http://127.0.0.1:4545/cli/tests/subdir/mt_video_mp2t.t3.ts")
@@ -1418,7 +1387,7 @@ mod tests {
       .await;
     assert!(result.is_ok());
     let r = result.unwrap();
-    assert_eq!(r.source_code, b"export const loaded = true;\n");
+    assert_eq!(r.source_code.bytes, b"export const loaded = true;\n");
     assert_eq!(&(r.media_type), &msg::MediaType::TypeScript);
 
     // Modify .metadata.json, make sure read from local
@@ -1434,33 +1403,20 @@ mod tests {
     let result2 = fetcher.fetch_cached_remote_source(&module_url, 1);
     assert!(result2.is_ok());
     let r2 = result2.unwrap().unwrap();
-    assert_eq!(r2.source_code, b"export const loaded = true;\n");
+    assert_eq!(r2.source_code.bytes, b"export const loaded = true;\n");
     // Not MediaType::TypeScript due to .headers.json modification
     assert_eq!(&(r2.media_type), &msg::MediaType::JavaScript);
-
-    drop(http_server_guard);
   }
 
   #[tokio::test]
-  async fn test_fetch_source_2() {
-    let http_server_guard = crate::test_util::http_server();
+  async fn fetch_remote_source_no_ext() {
+    let _g = test_util::http_server();
     let (_temp_dir, fetcher) = test_setup();
-    let fetcher_1 = fetcher.clone();
-    let fetcher_2 = fetcher.clone();
     let module_url =
-      Url::parse("http://localhost:4545/cli/tests/subdir/no_ext").unwrap();
-    let module_url_2 =
-      Url::parse("http://localhost:4545/cli/tests/subdir/mismatch_ext.ts")
-        .unwrap();
-    let module_url_2_ = module_url_2.clone();
-    let module_url_3 =
-      Url::parse("http://localhost:4545/cli/tests/subdir/unknown_ext.deno")
-        .unwrap();
-    let module_url_3_ = module_url_3.clone();
-
+      &Url::parse("http://localhost:4545/cli/tests/subdir/no_ext").unwrap();
     let result = fetcher
       .fetch_remote_source(
-        &module_url,
+        module_url,
         false,
         false,
         10,
@@ -1469,13 +1425,22 @@ mod tests {
       .await;
     assert!(result.is_ok());
     let r = result.unwrap();
-    assert_eq!(r.source_code, b"export const loaded = true;\n");
+    assert_eq!(r.source_code.bytes, b"export const loaded = true;\n");
     assert_eq!(&(r.media_type), &msg::MediaType::TypeScript);
-    let (_, headers) = fetcher.http_cache.get(&module_url).unwrap();
+    let (_, headers) = fetcher.http_cache.get(module_url).unwrap();
     assert_eq!(headers.get("content-type").unwrap(), "text/typescript");
-    let result = fetcher_1
+  }
+
+  #[tokio::test]
+  async fn fetch_remote_source_mismatch_ext() {
+    let _g = test_util::http_server();
+    let (_temp_dir, fetcher) = test_setup();
+    let module_url =
+      &Url::parse("http://localhost:4545/cli/tests/subdir/mismatch_ext.ts")
+        .unwrap();
+    let result = fetcher
       .fetch_remote_source(
-        &module_url_2,
+        module_url,
         false,
         false,
         10,
@@ -1484,15 +1449,22 @@ mod tests {
       .await;
     assert!(result.is_ok());
     let r2 = result.unwrap();
-    assert_eq!(r2.source_code, b"export const loaded = true;\n");
+    assert_eq!(r2.source_code.bytes, b"export const loaded = true;\n");
     assert_eq!(&(r2.media_type), &msg::MediaType::JavaScript);
-    let (_, headers) = fetcher.http_cache.get(&module_url_2_).unwrap();
+    let (_, headers) = fetcher.http_cache.get(module_url).unwrap();
     assert_eq!(headers.get("content-type").unwrap(), "text/javascript");
+  }
 
-    // test unknown extension
-    let result = fetcher_2
+  #[tokio::test]
+  async fn fetch_remote_source_unknown_ext() {
+    let _g = test_util::http_server();
+    let (_temp_dir, fetcher) = test_setup();
+    let module_url =
+      &Url::parse("http://localhost:4545/cli/tests/subdir/unknown_ext.deno")
+        .unwrap();
+    let result = fetcher
       .fetch_remote_source(
-        &module_url_3,
+        module_url,
         false,
         false,
         10,
@@ -1501,12 +1473,10 @@ mod tests {
       .await;
     assert!(result.is_ok());
     let r3 = result.unwrap();
-    assert_eq!(r3.source_code, b"export const loaded = true;\n");
+    assert_eq!(r3.source_code.bytes, b"export const loaded = true;\n");
     assert_eq!(&(r3.media_type), &msg::MediaType::TypeScript);
-    let (_, headers) = fetcher.http_cache.get(&module_url_3_).unwrap();
+    let (_, headers) = fetcher.http_cache.get(module_url).unwrap();
     assert_eq!(headers.get("content-type").unwrap(), "text/typescript");
-
-    drop(http_server_guard);
   }
 
   #[tokio::test]
@@ -1521,8 +1491,8 @@ mod tests {
       .await;
     assert!(r.is_err());
 
-    let p =
-      std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("js/main.ts");
+    let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+      .join("rt/99_main.js");
     let specifier =
       ModuleSpecifier::resolve_url_or_path(p.to_str().unwrap()).unwrap();
     let r = fetcher
@@ -1544,8 +1514,8 @@ mod tests {
       .await;
     assert!(r.is_err());
 
-    let p =
-      std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("js/main.ts");
+    let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+      .join("rt/99_main.js");
     let specifier =
       ModuleSpecifier::resolve_url_or_path(p.to_str().unwrap()).unwrap();
     let r = fetcher
@@ -1581,6 +1551,63 @@ mod tests {
       let url = Url::parse(test).unwrap();
       assert!(SourceFileFetcher::check_if_supported_scheme(&url).is_err());
     }
+  }
+
+  async fn test_fetch_source_file_from_disk_nonstandard_encoding(
+    charset: &str,
+    expected_content: String,
+  ) {
+    let (_temp_dir, fetcher) = test_setup();
+
+    let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+      .join(format!("tests/encoding/{}.ts", charset));
+    let specifier =
+      ModuleSpecifier::resolve_url_or_path(p.to_str().unwrap()).unwrap();
+    let r = fetcher
+      .fetch_source_file(&specifier, None, Permissions::allow_all())
+      .await;
+    assert!(r.is_ok());
+    let fetched_file = r.unwrap();
+    let source_code = fetched_file.source_code.to_str();
+    assert!(source_code.is_ok());
+    let actual = source_code.unwrap();
+    assert_eq!(expected_content, actual);
+  }
+
+  #[tokio::test]
+  async fn test_fetch_source_file_from_disk_utf_16_be() {
+    test_fetch_source_file_from_disk_nonstandard_encoding(
+      "utf-16be",
+      String::from_utf8(
+        b"\xEF\xBB\xBFconsole.log(\"Hello World\");\x0A".to_vec(),
+      )
+      .unwrap(),
+    )
+    .await;
+  }
+
+  #[tokio::test]
+  async fn test_fetch_source_file_from_disk_utf_16_le() {
+    test_fetch_source_file_from_disk_nonstandard_encoding(
+      "utf-16le",
+      String::from_utf8(
+        b"\xEF\xBB\xBFconsole.log(\"Hello World\");\x0A".to_vec(),
+      )
+      .unwrap(),
+    )
+    .await;
+  }
+
+  #[tokio::test]
+  async fn test_fetch_source_file_from_disk_utf_8_with_bom() {
+    test_fetch_source_file_from_disk_nonstandard_encoding(
+      "utf-8",
+      String::from_utf8(
+        b"\xEF\xBB\xBFconsole.log(\"Hello World\");\x0A".to_vec(),
+      )
+      .unwrap(),
+    )
+    .await;
   }
 
   #[test]
@@ -1631,43 +1658,43 @@ mod tests {
   fn test_map_content_type_extension_only() {
     // Extension only
     assert_eq!(
-      map_content_type(Path::new("foo/bar.ts"), None),
+      map_content_type(Path::new("foo/bar.ts"), None).0,
       msg::MediaType::TypeScript
     );
     assert_eq!(
-      map_content_type(Path::new("foo/bar.tsx"), None),
+      map_content_type(Path::new("foo/bar.tsx"), None).0,
       msg::MediaType::TSX
     );
     assert_eq!(
-      map_content_type(Path::new("foo/bar.d.ts"), None),
+      map_content_type(Path::new("foo/bar.d.ts"), None).0,
       msg::MediaType::TypeScript
     );
     assert_eq!(
-      map_content_type(Path::new("foo/bar.js"), None),
+      map_content_type(Path::new("foo/bar.js"), None).0,
       msg::MediaType::JavaScript
     );
     assert_eq!(
-      map_content_type(Path::new("foo/bar.txt"), None),
+      map_content_type(Path::new("foo/bar.txt"), None).0,
       msg::MediaType::Unknown
     );
     assert_eq!(
-      map_content_type(Path::new("foo/bar.jsx"), None),
+      map_content_type(Path::new("foo/bar.jsx"), None).0,
       msg::MediaType::JSX
     );
     assert_eq!(
-      map_content_type(Path::new("foo/bar.json"), None),
+      map_content_type(Path::new("foo/bar.json"), None).0,
       msg::MediaType::Json
     );
     assert_eq!(
-      map_content_type(Path::new("foo/bar.wasm"), None),
+      map_content_type(Path::new("foo/bar.wasm"), None).0,
       msg::MediaType::Wasm
     );
     assert_eq!(
-      map_content_type(Path::new("foo/bar.cjs"), None),
+      map_content_type(Path::new("foo/bar.cjs"), None).0,
       msg::MediaType::JavaScript
     );
     assert_eq!(
-      map_content_type(Path::new("foo/bar"), None),
+      map_content_type(Path::new("foo/bar"), None).0,
       msg::MediaType::Unknown
     );
   }
@@ -1676,146 +1703,160 @@ mod tests {
   fn test_map_content_type_media_type_with_no_extension() {
     // Media Type
     assert_eq!(
-      map_content_type(Path::new("foo/bar"), Some("application/typescript")),
+      map_content_type(Path::new("foo/bar"), Some("application/typescript")).0,
       msg::MediaType::TypeScript
     );
     assert_eq!(
-      map_content_type(Path::new("foo/bar"), Some("text/typescript")),
+      map_content_type(Path::new("foo/bar"), Some("text/typescript")).0,
       msg::MediaType::TypeScript
     );
     assert_eq!(
-      map_content_type(Path::new("foo/bar"), Some("video/vnd.dlna.mpeg-tts")),
+      map_content_type(Path::new("foo/bar"), Some("video/vnd.dlna.mpeg-tts")).0,
       msg::MediaType::TypeScript
     );
     assert_eq!(
-      map_content_type(Path::new("foo/bar"), Some("video/mp2t")),
+      map_content_type(Path::new("foo/bar"), Some("video/mp2t")).0,
       msg::MediaType::TypeScript
     );
     assert_eq!(
-      map_content_type(Path::new("foo/bar"), Some("application/x-typescript")),
+      map_content_type(Path::new("foo/bar"), Some("application/x-typescript"))
+        .0,
       msg::MediaType::TypeScript
     );
     assert_eq!(
-      map_content_type(Path::new("foo/bar"), Some("application/javascript")),
+      map_content_type(Path::new("foo/bar"), Some("application/javascript")).0,
       msg::MediaType::JavaScript
     );
     assert_eq!(
-      map_content_type(Path::new("foo/bar"), Some("text/javascript")),
+      map_content_type(Path::new("foo/bar"), Some("text/javascript")).0,
       msg::MediaType::JavaScript
     );
     assert_eq!(
-      map_content_type(Path::new("foo/bar"), Some("application/ecmascript")),
+      map_content_type(Path::new("foo/bar"), Some("application/ecmascript")).0,
       msg::MediaType::JavaScript
     );
     assert_eq!(
-      map_content_type(Path::new("foo/bar"), Some("text/ecmascript")),
+      map_content_type(Path::new("foo/bar"), Some("text/ecmascript")).0,
       msg::MediaType::JavaScript
     );
     assert_eq!(
-      map_content_type(Path::new("foo/bar"), Some("application/x-javascript")),
+      map_content_type(Path::new("foo/bar"), Some("application/x-javascript"))
+        .0,
       msg::MediaType::JavaScript
     );
     assert_eq!(
-      map_content_type(Path::new("foo/bar"), Some("application/json")),
+      map_content_type(Path::new("foo/bar"), Some("application/json")).0,
       msg::MediaType::Json
     );
     assert_eq!(
-      map_content_type(Path::new("foo/bar"), Some("application/node")),
+      map_content_type(Path::new("foo/bar"), Some("application/node")).0,
       msg::MediaType::JavaScript
     );
     assert_eq!(
-      map_content_type(Path::new("foo/bar"), Some("text/json")),
+      map_content_type(Path::new("foo/bar"), Some("text/json")).0,
       msg::MediaType::Json
+    );
+    assert_eq!(
+      map_content_type(Path::new("foo/bar"), Some("text/json; charset=utf-8 ")),
+      (msg::MediaType::Json, Some("utf-8".to_owned()))
     );
   }
 
   #[test]
   fn test_map_file_extension_media_type_with_extension() {
     assert_eq!(
-      map_content_type(Path::new("foo/bar.ts"), Some("text/plain")),
+      map_content_type(Path::new("foo/bar.ts"), Some("text/plain")).0,
       msg::MediaType::TypeScript
     );
     assert_eq!(
-      map_content_type(Path::new("foo/bar.ts"), Some("foo/bar")),
+      map_content_type(Path::new("foo/bar.ts"), Some("foo/bar")).0,
       msg::MediaType::Unknown
     );
     assert_eq!(
       map_content_type(
         Path::new("foo/bar.tsx"),
         Some("application/typescript"),
-      ),
+      )
+      .0,
       msg::MediaType::TSX
     );
     assert_eq!(
       map_content_type(
         Path::new("foo/bar.tsx"),
         Some("application/javascript"),
-      ),
+      )
+      .0,
       msg::MediaType::TSX
     );
     assert_eq!(
       map_content_type(
         Path::new("foo/bar.tsx"),
         Some("application/x-typescript"),
-      ),
+      )
+      .0,
       msg::MediaType::TSX
     );
     assert_eq!(
       map_content_type(
         Path::new("foo/bar.tsx"),
         Some("video/vnd.dlna.mpeg-tts"),
-      ),
+      )
+      .0,
       msg::MediaType::TSX
     );
     assert_eq!(
-      map_content_type(Path::new("foo/bar.tsx"), Some("video/mp2t")),
+      map_content_type(Path::new("foo/bar.tsx"), Some("video/mp2t")).0,
       msg::MediaType::TSX
     );
     assert_eq!(
       map_content_type(
         Path::new("foo/bar.jsx"),
         Some("application/javascript"),
-      ),
+      )
+      .0,
       msg::MediaType::JSX
     );
     assert_eq!(
       map_content_type(
         Path::new("foo/bar.jsx"),
         Some("application/x-typescript"),
-      ),
+      )
+      .0,
       msg::MediaType::JSX
     );
     assert_eq!(
       map_content_type(
         Path::new("foo/bar.jsx"),
         Some("application/ecmascript"),
-      ),
+      )
+      .0,
       msg::MediaType::JSX
     );
     assert_eq!(
-      map_content_type(Path::new("foo/bar.jsx"), Some("text/ecmascript")),
+      map_content_type(Path::new("foo/bar.jsx"), Some("text/ecmascript")).0,
       msg::MediaType::JSX
     );
     assert_eq!(
       map_content_type(
         Path::new("foo/bar.jsx"),
         Some("application/x-javascript"),
-      ),
+      )
+      .0,
       msg::MediaType::JSX
     );
   }
 
   #[test]
   fn test_filter_shebang() {
-    assert_eq!(filter_shebang(b"#!"[..].to_owned()), b"");
-    assert_eq!(filter_shebang(b"#!\n\n"[..].to_owned()), b"\n\n");
-    let code = b"#!/usr/bin/env deno\nconsole.log('hello');\n"[..].to_owned();
+    assert_eq!(filter_shebang("#!"), b"");
+    assert_eq!(filter_shebang("#!\n\n"), b"\n\n");
+    let code = "#!/usr/bin/env deno\nconsole.log('hello');\n";
     assert_eq!(filter_shebang(code), b"\nconsole.log('hello');\n");
   }
 
   #[tokio::test]
   async fn test_fetch_with_etag() {
-    let http_server_guard = crate::test_util::http_server();
+    let _http_server_guard = test_util::http_server();
     let (_temp_dir, fetcher) = test_setup();
     let module_url =
       Url::parse("http://127.0.0.1:4545/etag_script.ts").unwrap();
@@ -1831,7 +1872,7 @@ mod tests {
       .await;
     assert!(source.is_ok());
     let source = source.unwrap();
-    assert_eq!(source.source_code, b"console.log('etag')");
+    assert_eq!(source.source_code.bytes, b"console.log('etag')");
     assert_eq!(&(source.media_type), &msg::MediaType::TypeScript);
 
     let (_, headers) = fetcher.http_cache.get(&module_url).unwrap();
@@ -1858,98 +1899,17 @@ mod tests {
       )
       .await
       .unwrap();
-    assert_eq!(cached_source.source_code, b"changed content");
+    assert_eq!(cached_source.source_code.bytes, b"changed content");
 
     let modified2 = metadata_path.metadata().unwrap().modified().unwrap();
 
     // Assert that the file has not been modified
     assert_eq!(modified1, modified2);
-
-    drop(http_server_guard);
-  }
-
-  #[test]
-  fn test_get_types_url_1() {
-    let module_url = Url::parse("https://example.com/mod.js").unwrap();
-    let source_code = b"console.log(\"foo\");".to_owned();
-    let result = get_types_url(&module_url, &source_code, None);
-    assert_eq!(result, None);
-  }
-
-  #[test]
-  fn test_get_types_url_2() {
-    let module_url = Url::parse("https://example.com/mod.js").unwrap();
-    let source_code = r#"/// <reference types="./mod.d.ts" />
-    console.log("foo");"#
-      .as_bytes()
-      .to_owned();
-    let result = get_types_url(&module_url, &source_code, None);
-    assert_eq!(
-      result,
-      Some(Url::parse("https://example.com/mod.d.ts").unwrap())
-    );
-  }
-
-  #[test]
-  fn test_get_types_url_3() {
-    let module_url = Url::parse("https://example.com/mod.js").unwrap();
-    let source_code = r#"/// <reference types="https://deno.land/mod.d.ts" />
-    console.log("foo");"#
-      .as_bytes()
-      .to_owned();
-    let result = get_types_url(&module_url, &source_code, None);
-    assert_eq!(
-      result,
-      Some(Url::parse("https://deno.land/mod.d.ts").unwrap())
-    );
-  }
-
-  #[test]
-  fn test_get_types_url_4() {
-    let module_url = Url::parse("file:///foo/bar/baz.js").unwrap();
-    let source_code = r#"/// <reference types="../qat/baz.d.ts" />
-    console.log("foo");"#
-      .as_bytes()
-      .to_owned();
-    let result = get_types_url(&module_url, &source_code, None);
-    assert_eq!(
-      result,
-      Some(Url::parse("file:///foo/qat/baz.d.ts").unwrap())
-    );
-  }
-
-  #[test]
-  fn test_get_types_url_5() {
-    let module_url = Url::parse("https://example.com/mod.js").unwrap();
-    let source_code = b"console.log(\"foo\");".to_owned();
-    let result = get_types_url(&module_url, &source_code, Some("./mod.d.ts"));
-    assert_eq!(
-      result,
-      Some(Url::parse("https://example.com/mod.d.ts").unwrap())
-    );
-  }
-
-  #[test]
-  fn test_get_types_url_6() {
-    let module_url = Url::parse("https://example.com/mod.js").unwrap();
-    let source_code = r#"/// <reference types="./mod.d.ts" />
-    console.log("foo");"#
-      .as_bytes()
-      .to_owned();
-    let result = get_types_url(
-      &module_url,
-      &source_code,
-      Some("https://deno.land/mod.d.ts"),
-    );
-    assert_eq!(
-      result,
-      Some(Url::parse("https://deno.land/mod.d.ts").unwrap())
-    );
   }
 
   #[tokio::test]
   async fn test_fetch_with_types_header() {
-    let http_server_guard = crate::test_util::http_server();
+    let _http_server_guard = test_util::http_server();
     let (_temp_dir, fetcher) = test_setup();
     let module_url =
       Url::parse("http://127.0.0.1:4545/xTypeScriptTypes.js").unwrap();
@@ -1964,21 +1924,65 @@ mod tests {
       .await;
     assert!(source.is_ok());
     let source = source.unwrap();
-    assert_eq!(source.source_code, b"export const foo = 'foo';");
+    assert_eq!(source.source_code.bytes, b"export const foo = 'foo';");
     assert_eq!(&(source.media_type), &msg::MediaType::JavaScript);
     assert_eq!(
-      source.types_url,
-      Some(Url::parse("http://127.0.0.1:4545/xTypeScriptTypes.d.ts").unwrap())
+      source.types_header,
+      Some("./xTypeScriptTypes.d.ts".to_string())
     );
-    drop(http_server_guard);
   }
 
   #[tokio::test]
-  async fn test_fetch_with_types_reference() {
-    let http_server_guard = crate::test_util::http_server();
+  async fn test_fetch_source_file_from_net_utf16_le() {
+    let content =
+      std::str::from_utf8(b"\xEF\xBB\xBFconsole.log(\"Hello World\");\x0A")
+        .unwrap();
+    test_fetch_non_utf8_source_file_from_net(
+      "utf-16le",
+      "utf-16le.ts",
+      content,
+    )
+    .await;
+  }
+
+  #[tokio::test]
+  async fn test_fetch_source_file_from_net_utf16_be() {
+    let content =
+      std::str::from_utf8(b"\xEF\xBB\xBFconsole.log(\"Hello World\");\x0A")
+        .unwrap();
+    test_fetch_non_utf8_source_file_from_net(
+      "utf-16be",
+      "utf-16be.ts",
+      content,
+    )
+    .await;
+  }
+
+  #[tokio::test]
+  async fn test_fetch_source_file_from_net_windows_1255() {
+    let content = "console.log(\"\u{5E9}\u{5DC}\u{5D5}\u{5DD} \
+                   \u{5E2}\u{5D5}\u{5DC}\u{5DD}\");\u{A}";
+    test_fetch_non_utf8_source_file_from_net(
+      "windows-1255",
+      "windows-1255",
+      content,
+    )
+    .await;
+  }
+
+  async fn test_fetch_non_utf8_source_file_from_net(
+    charset: &str,
+    file_name: &str,
+    expected_content: &str,
+  ) {
+    let _http_server_guard = test_util::http_server();
     let (_temp_dir, fetcher) = test_setup();
-    let module_url =
-      Url::parse("http://127.0.0.1:4545/referenceTypes.js").unwrap();
+    let module_url = Url::parse(&format!(
+      "http://127.0.0.1:4545/cli/tests/encoding/{}",
+      file_name
+    ))
+    .unwrap();
+
     let source = fetcher
       .fetch_remote_source(
         &module_url,
@@ -1990,11 +1994,15 @@ mod tests {
       .await;
     assert!(source.is_ok());
     let source = source.unwrap();
-    assert_eq!(&(source.media_type), &msg::MediaType::JavaScript);
+    assert_eq!(&source.source_code.charset.to_lowercase()[..], charset);
+    let text = &source.source_code.to_str().unwrap();
+    assert_eq!(text, expected_content);
+    assert_eq!(&(source.media_type), &msg::MediaType::TypeScript);
+
+    let (_, headers) = fetcher.http_cache.get(&module_url).unwrap();
     assert_eq!(
-      source.types_url,
-      Some(Url::parse("http://127.0.0.1:4545/xTypeScriptTypes.d.ts").unwrap())
+      headers.get("content-type").unwrap(),
+      &format!("application/typescript;charset={}", charset)
     );
-    drop(http_server_guard);
   }
 }

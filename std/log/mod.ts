@@ -8,9 +8,11 @@ import {
   RotatingFileHandler,
 } from "./handlers.ts";
 import { assert } from "../_util/assert.ts";
-import { LevelName } from "./levels.ts";
+import type { LevelName } from "./levels.ts";
 
 export { LogLevels } from "./levels.ts";
+export type { LevelName } from "./levels.ts";
+export { Logger } from "./logger.ts";
 
 export class LoggerConfig {
   level?: LevelName;
@@ -59,13 +61,13 @@ export function getLogger(name?: string): Logger {
     const d = state.loggers.get("default");
     assert(
       d != null,
-      `"default" logger must be set for getting logger without name`
+      `"default" logger must be set for getting logger without name`,
     );
     return d;
   }
   const result = state.loggers.get(name);
   if (!result) {
-    const logger = new Logger("NOTSET", []);
+    const logger = new Logger(name, "NOTSET", { handlers: [] });
     state.loggers.set(name, logger);
     return logger;
   }
@@ -191,7 +193,7 @@ export async function setup(config: LogConfig): Promise<void> {
     });
 
     const levelName = loggerConfig.level || DEFAULT_LEVEL;
-    const logger = new Logger(levelName, handlers);
+    const logger = new Logger(loggerName, levelName, { handlers: handlers });
     state.loggers.set(loggerName, logger);
   }
 }

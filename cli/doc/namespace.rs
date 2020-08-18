@@ -1,10 +1,8 @@
 // Copyright 2018-2020 the Deno authors. All rights reserved. MIT license.
-use crate::swc_ecma_ast;
 use serde::Serialize;
 
 use super::parser::DocParser;
 use super::DocNode;
-use super::DocNodeKind;
 
 #[derive(Debug, Serialize, Clone)]
 pub struct NamespaceDef {
@@ -13,7 +11,7 @@ pub struct NamespaceDef {
 
 pub fn get_doc_for_ts_namespace_decl(
   doc_parser: &DocParser,
-  ts_namespace_decl: &swc_ecma_ast::TsNamespaceDecl,
+  ts_namespace_decl: &swc_ecmascript::ast::TsNamespaceDecl,
 ) -> DocNode {
   let js_doc = doc_parser.js_doc_for_span(ts_namespace_decl.span);
   let location = doc_parser
@@ -22,7 +20,7 @@ pub fn get_doc_for_ts_namespace_decl(
     .into();
   let namespace_name = ts_namespace_decl.id.sym.to_string();
 
-  use crate::swc_ecma_ast::TsNamespaceBody::*;
+  use swc_ecmascript::ast::TsNamespaceBody::*;
 
   let elements = match &*ts_namespace_decl.body {
     TsModuleBlock(ts_module_block) => {
@@ -35,33 +33,21 @@ pub fn get_doc_for_ts_namespace_decl(
 
   let ns_def = NamespaceDef { elements };
 
-  DocNode {
-    kind: DocNodeKind::Namespace,
-    name: namespace_name,
-    location,
-    js_doc,
-    namespace_def: Some(ns_def),
-    function_def: None,
-    variable_def: None,
-    enum_def: None,
-    class_def: None,
-    type_alias_def: None,
-    interface_def: None,
-  }
+  DocNode::namespace(namespace_name, location, js_doc, ns_def)
 }
 
 pub fn get_doc_for_ts_module(
   doc_parser: &DocParser,
-  ts_module_decl: &swc_ecma_ast::TsModuleDecl,
+  ts_module_decl: &swc_ecmascript::ast::TsModuleDecl,
 ) -> (String, NamespaceDef) {
-  use crate::swc_ecma_ast::TsModuleName;
+  use swc_ecmascript::ast::TsModuleName;
   let namespace_name = match &ts_module_decl.id {
     TsModuleName::Ident(ident) => ident.sym.to_string(),
     TsModuleName::Str(str_) => str_.value.to_string(),
   };
 
   let elements = if let Some(body) = &ts_module_decl.body {
-    use crate::swc_ecma_ast::TsNamespaceBody::*;
+    use swc_ecmascript::ast::TsNamespaceBody::*;
 
     match &body {
       TsModuleBlock(ts_module_block) => {

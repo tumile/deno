@@ -1,15 +1,13 @@
 // Copyright 2018-2020 the Deno authors. All rights reserved. MIT license.
 use crate::file_fetcher::map_file_extension;
 use crate::op_error::OpError;
-use crate::swc_common::comments::CommentKind;
-use crate::swc_common::Span;
-use crate::swc_ecma_ast;
-use crate::swc_ecma_ast::Decl;
-use crate::swc_ecma_ast::DefaultDecl;
-use crate::swc_ecma_ast::ModuleDecl;
-use crate::swc_ecma_ast::Stmt;
 use crate::swc_util::AstParser;
-use crate::swc_util::SwcDiagnosticBuffer;
+use swc_common::comments::CommentKind;
+use swc_common::Span;
+use swc_ecmascript::ast::Decl;
+use swc_ecmascript::ast::DefaultDecl;
+use swc_ecmascript::ast::ModuleDecl;
+use swc_ecmascript::ast::Stmt;
 
 use deno_core::ErrBox;
 use deno_core::ModuleSpecifier;
@@ -24,6 +22,7 @@ use super::node;
 use super::node::ModuleDoc;
 use super::DocNode;
 use super::DocNodeKind;
+use super::ImportDef;
 use super::Location;
 
 pub trait DocFileLoader {
@@ -44,13 +43,15 @@ pub trait DocFileLoader {
 pub struct DocParser {
   pub ast_parser: AstParser,
   pub loader: Box<dyn DocFileLoader>,
+  pub private: bool,
 }
 
 impl DocParser {
-  pub fn new(loader: Box<dyn DocFileLoader>) -> Self {
+  pub fn new(loader: Box<dyn DocFileLoader>, private: bool) -> Self {
     DocParser {
       loader,
-      ast_parser: AstParser::new(),
+      ast_parser: AstParser::default(),
+      private,
     }
   }
 
@@ -58,24 +59,24 @@ impl DocParser {
     &self,
     file_name: &str,
     source_code: &str,
-  ) -> Result<ModuleDoc, SwcDiagnosticBuffer> {
+  ) -> Result<ModuleDoc, ErrBox> {
     let media_type = map_file_extension(&PathBuf::from(file_name));
-    self.ast_parser.parse_module(
-      file_name,
-      media_type,
-      source_code,
-      |parse_result| {
-        let module = parse_result?;
-        let doc_entries =
-          self.get_doc_nodes_for_module_body(module.body.clone());
-        let reexports = self.get_reexports_for_module_body(module.body);
-        let module_doc = ModuleDoc {
-          exports: doc_entries,
-          reexports,
-        };
-        Ok(module_doc)
-      },
-    )
+    let parse_result =
+      self
+        .ast_parser
+        .parse_module(file_name, media_type, source_code);
+    let module = parse_result?;
+    let mut doc_entries =
+      self.get_doc_nodes_for_module_body(module.body.clone());
+    let import_doc_entries =
+      self.get_doc_nodes_for_module_imports(module.body.clone(), file_name)?;
+    doc_entries.extend(import_doc_entries);
+    let reexports = self.get_reexports_for_module_body(module.body);
+    let module_doc = ModuleDoc {
+      definitions: doc_entries,
+      reexports,
+    };
+    Ok(module_doc)
   }
 
   pub async fn parse(&self, file_name: &str) -> Result<Vec<DocNode>, ErrBox> {
@@ -90,7 +91,7 @@ impl DocParser {
     source_code: &str,
   ) -> Result<Vec<DocNode>, ErrBox> {
     let module_doc = self.parse_module(file_name, &source_code)?;
-    Ok(module_doc.exports)
+    Ok(module_doc.definitions)
   }
 
   async fn flatten_reexports(
@@ -141,6 +142,7 @@ impl DocParser {
               variable_def: None,
               function_def: None,
               class_def: None,
+              import_def: None,
             };
             processed_reexports.push(ns_doc_node);
           }
@@ -187,13 +189,71 @@ impl DocParser {
       let mut flattenned_reexports = self
         .flatten_reexports(&module_doc.reexports, file_name)
         .await?;
-      flattenned_reexports.extend(module_doc.exports);
+      flattenned_reexports.extend(module_doc.definitions);
       flattenned_reexports
     } else {
-      module_doc.exports
+      module_doc.definitions
     };
 
     Ok(flattened_docs)
+  }
+
+  fn get_doc_nodes_for_module_imports(
+    &self,
+    module_body: Vec<swc_ecmascript::ast::ModuleItem>,
+    referrer: &str,
+  ) -> Result<Vec<DocNode>, ErrBox> {
+    let mut imports = vec![];
+
+    for node in module_body.iter() {
+      if let swc_ecmascript::ast::ModuleItem::ModuleDecl(module_decl) = node {
+        if let ModuleDecl::Import(import_decl) = module_decl {
+          let (js_doc, location) = self.details_for_span(import_decl.span);
+          for specifier in &import_decl.specifiers {
+            use swc_ecmascript::ast::ImportSpecifier::*;
+
+            let (name, maybe_imported_name, src) = match specifier {
+              Named(named_specifier) => (
+                named_specifier.local.sym.to_string(),
+                named_specifier
+                  .imported
+                  .as_ref()
+                  .map(|ident| ident.sym.to_string())
+                  .or_else(|| Some(named_specifier.local.sym.to_string())),
+                import_decl.src.value.to_string(),
+              ),
+              Default(default_specifier) => (
+                default_specifier.local.sym.to_string(),
+                Some("default".to_string()),
+                import_decl.src.value.to_string(),
+              ),
+              Namespace(namespace_specifier) => (
+                namespace_specifier.local.sym.to_string(),
+                None,
+                import_decl.src.value.to_string(),
+              ),
+            };
+
+            let resolved_specifier = self.loader.resolve(&src, referrer)?;
+            let import_def = ImportDef {
+              src: resolved_specifier.to_string(),
+              imported: maybe_imported_name,
+            };
+
+            let doc_node = DocNode::import(
+              name,
+              location.clone(),
+              js_doc.clone(),
+              import_def,
+            );
+
+            imports.push(doc_node);
+          }
+        }
+      }
+    }
+
+    Ok(imports)
   }
 
   pub fn get_doc_nodes_for_module_exports(
@@ -216,36 +276,14 @@ impl DocParser {
           DefaultDecl::Class(class_expr) => {
             let class_def =
               crate::doc::class::class_to_class_def(self, &class_expr.class);
-            DocNode {
-              kind: DocNodeKind::Class,
-              name,
-              location,
-              js_doc,
-              class_def: Some(class_def),
-              function_def: None,
-              variable_def: None,
-              enum_def: None,
-              type_alias_def: None,
-              namespace_def: None,
-              interface_def: None,
-            }
+            DocNode::class(name, location, js_doc, class_def)
           }
           DefaultDecl::Fn(fn_expr) => {
-            let function_def =
-              crate::doc::function::function_to_function_def(&fn_expr.function);
-            DocNode {
-              kind: DocNodeKind::Function,
-              name,
-              location,
-              js_doc,
-              class_def: None,
-              function_def: Some(function_def),
-              variable_def: None,
-              enum_def: None,
-              type_alias_def: None,
-              namespace_def: None,
-              interface_def: None,
-            }
+            let function_def = crate::doc::function::function_to_function_def(
+              self,
+              &fn_expr.function,
+            );
+            DocNode::function(name, location, js_doc, function_def)
           }
           DefaultDecl::TsInterfaceDecl(interface_decl) => {
             let (_, interface_def) =
@@ -253,19 +291,7 @@ impl DocParser {
                 self,
                 interface_decl,
               );
-            DocNode {
-              kind: DocNodeKind::Interface,
-              name,
-              location,
-              js_doc,
-              class_def: None,
-              function_def: None,
-              variable_def: None,
-              enum_def: None,
-              type_alias_def: None,
-              namespace_def: None,
-              interface_def: Some(interface_def),
-            }
+            DocNode::interface(name, location, js_doc, interface_def)
           }
         };
 
@@ -292,69 +318,33 @@ impl DocParser {
   pub fn get_doc_node_for_decl(&self, decl: &Decl) -> Option<DocNode> {
     match decl {
       Decl::Class(class_decl) => {
-        if !class_decl.declare {
+        if !self.private && !class_decl.declare {
           return None;
         }
         let (name, class_def) =
           super::class::get_doc_for_class_decl(self, class_decl);
         let (js_doc, location) = self.details_for_span(class_decl.class.span);
-        Some(DocNode {
-          kind: DocNodeKind::Class,
-          name,
-          location,
-          js_doc,
-          class_def: Some(class_def),
-          function_def: None,
-          variable_def: None,
-          enum_def: None,
-          type_alias_def: None,
-          namespace_def: None,
-          interface_def: None,
-        })
+        Some(DocNode::class(name, location, js_doc, class_def))
       }
       Decl::Fn(fn_decl) => {
-        if !fn_decl.declare {
+        if !self.private && !fn_decl.declare {
           return None;
         }
         let (name, function_def) =
-          super::function::get_doc_for_fn_decl(fn_decl);
+          super::function::get_doc_for_fn_decl(self, fn_decl);
         let (js_doc, location) = self.details_for_span(fn_decl.function.span);
-        Some(DocNode {
-          kind: DocNodeKind::Function,
-          name,
-          location,
-          js_doc,
-          function_def: Some(function_def),
-          class_def: None,
-          variable_def: None,
-          enum_def: None,
-          type_alias_def: None,
-          namespace_def: None,
-          interface_def: None,
-        })
+        Some(DocNode::function(name, location, js_doc, function_def))
       }
       Decl::Var(var_decl) => {
-        if !var_decl.declare {
+        if !self.private && !var_decl.declare {
           return None;
         }
         let (name, var_def) = super::variable::get_doc_for_var_decl(var_decl);
         let (js_doc, location) = self.details_for_span(var_decl.span);
-        Some(DocNode {
-          kind: DocNodeKind::Variable,
-          name,
-          location,
-          js_doc,
-          variable_def: Some(var_def),
-          function_def: None,
-          class_def: None,
-          enum_def: None,
-          type_alias_def: None,
-          namespace_def: None,
-          interface_def: None,
-        })
+        Some(DocNode::variable(name, location, js_doc, var_def))
       }
       Decl::TsInterface(ts_interface_decl) => {
-        if !ts_interface_decl.declare {
+        if !self.private && !ts_interface_decl.declare {
           return None;
         }
         let (name, interface_def) =
@@ -363,22 +353,10 @@ impl DocParser {
             ts_interface_decl,
           );
         let (js_doc, location) = self.details_for_span(ts_interface_decl.span);
-        Some(DocNode {
-          kind: DocNodeKind::Interface,
-          name,
-          location,
-          js_doc,
-          interface_def: Some(interface_def),
-          variable_def: None,
-          function_def: None,
-          class_def: None,
-          enum_def: None,
-          type_alias_def: None,
-          namespace_def: None,
-        })
+        Some(DocNode::interface(name, location, js_doc, interface_def))
       }
       Decl::TsTypeAlias(ts_type_alias) => {
-        if !ts_type_alias.declare {
+        if !self.private && !ts_type_alias.declare {
           return None;
         }
         let (name, type_alias_def) =
@@ -387,75 +365,39 @@ impl DocParser {
             ts_type_alias,
           );
         let (js_doc, location) = self.details_for_span(ts_type_alias.span);
-        Some(DocNode {
-          kind: DocNodeKind::TypeAlias,
-          name,
-          location,
-          js_doc,
-          type_alias_def: Some(type_alias_def),
-          interface_def: None,
-          variable_def: None,
-          function_def: None,
-          class_def: None,
-          enum_def: None,
-          namespace_def: None,
-        })
+        Some(DocNode::type_alias(name, location, js_doc, type_alias_def))
       }
       Decl::TsEnum(ts_enum) => {
-        if !ts_enum.declare {
+        if !self.private && !ts_enum.declare {
           return None;
         }
         let (name, enum_def) =
           super::r#enum::get_doc_for_ts_enum_decl(self, ts_enum);
         let (js_doc, location) = self.details_for_span(ts_enum.span);
-        Some(DocNode {
-          kind: DocNodeKind::Enum,
-          name,
-          location,
-          js_doc,
-          enum_def: Some(enum_def),
-          type_alias_def: None,
-          interface_def: None,
-          variable_def: None,
-          function_def: None,
-          class_def: None,
-          namespace_def: None,
-        })
+        Some(DocNode::r#enum(name, location, js_doc, enum_def))
       }
       Decl::TsModule(ts_module) => {
-        if !ts_module.declare {
+        if !self.private && !ts_module.declare {
           return None;
         }
         let (name, namespace_def) =
           super::namespace::get_doc_for_ts_module(self, ts_module);
         let (js_doc, location) = self.details_for_span(ts_module.span);
-        Some(DocNode {
-          kind: DocNodeKind::Namespace,
-          name,
-          location,
-          js_doc,
-          namespace_def: Some(namespace_def),
-          enum_def: None,
-          type_alias_def: None,
-          interface_def: None,
-          variable_def: None,
-          function_def: None,
-          class_def: None,
-        })
+        Some(DocNode::namespace(name, location, js_doc, namespace_def))
       }
     }
   }
 
   pub fn get_reexports_for_module_body(
     &self,
-    module_body: Vec<swc_ecma_ast::ModuleItem>,
+    module_body: Vec<swc_ecmascript::ast::ModuleItem>,
   ) -> Vec<node::Reexport> {
-    use swc_ecma_ast::ExportSpecifier::*;
+    use swc_ecmascript::ast::ExportSpecifier::*;
 
     let mut reexports: Vec<node::Reexport> = vec![];
 
     for node in module_body.iter() {
-      if let swc_ecma_ast::ModuleItem::ModuleDecl(module_decl) = node {
+      if let swc_ecmascript::ast::ModuleItem::ModuleDecl(module_decl) = node {
         let r = match module_decl {
           ModuleDecl::ExportNamed(named_export) => {
             if let Some(src) = &named_export.src {
@@ -509,16 +451,16 @@ impl DocParser {
 
   pub fn get_doc_nodes_for_module_body(
     &self,
-    module_body: Vec<swc_ecma_ast::ModuleItem>,
+    module_body: Vec<swc_ecmascript::ast::ModuleItem>,
   ) -> Vec<DocNode> {
     let mut doc_entries: Vec<DocNode> = vec![];
     for node in module_body.iter() {
       match node {
-        swc_ecma_ast::ModuleItem::ModuleDecl(module_decl) => {
+        swc_ecmascript::ast::ModuleItem::ModuleDecl(module_decl) => {
           doc_entries
             .extend(self.get_doc_nodes_for_module_exports(module_decl));
         }
-        swc_ecma_ast::ModuleItem::Stmt(stmt) => {
+        swc_ecmascript::ast::ModuleItem::Stmt(stmt) => {
           if let Some(doc_node) = self.get_doc_node_for_stmt(stmt) {
             doc_entries.push(doc_node);
           }

@@ -36,7 +36,10 @@
     "name": "Standard library"
   },
   "testing": {
-    "name": "Testing"
+    "name": "Testing",
+    "children": {
+      "assertions": "Assertions"
+    }
   },
   "tools": {
     "name": "Tools",
@@ -65,6 +68,9 @@
   "examples": {
     "name": "Examples",
     "children": {
+      "hello_world": "Hello World",
+      "import_export": "Import and Export Modules",
+      "manage_dependencies": "Manage Dependencies",
       "unix_cat": "Unix cat program",
       "file_server": "File server",
       "tcp_echo": "TCP echo server",
