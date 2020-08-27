@@ -44,7 +44,8 @@ pub fn parse(paths: Vec<String>) -> clap::Result<Vec<String>> {
     if Url::parse(&format!("deno://{}", host_and_port)).is_ok()
       || host_and_port.parse::<IpAddr>().is_ok()
     {
-      out.push(host_and_port.to_owned())
+      out.push(host_and_port.to_owned());
+      push_special_hosts(host_and_port, &mut out);
     } else if let Ok(port) = host_and_port.parse::<BarePort>() {
       // we got bare port, let's add default hosts
       for host in ["0.0.0.0", "127.0.0.1", "localhost"].iter() {
@@ -58,6 +59,36 @@ pub fn parse(paths: Vec<String>) -> clap::Result<Vec<String>> {
     }
   }
   Ok(out)
+}
+
+fn push_special_hosts(host_and_port: &str, out: &mut Vec<String>) {
+  let vec: Vec<&str> = host_and_port.split(":").collect();
+  match vec[0] {
+    "0.0.0.0" => {
+      if vec.len() == 1 {
+        out.push(String::from("127.0.0.1"));
+        out.push(String::from("localhost"));
+      } else {
+        out.push(format!("127.0.0.1:{}", vec[1]));
+        out.push(format!("localhost:{}", vec[1]));
+      }
+    },
+    "127.0.0.1" => {
+      if vec.len() == 1 {
+        out.push(String::from("localhost"));
+      } else {
+        out.push(format!("localhost:{}", vec[1]));
+      }
+    },
+    "localhost" => {
+      if vec.len() == 1 {
+        out.push(String::from("127.0.0.1"));
+      } else {
+        out.push(format!("127.0.0.1:{}", vec[1]));
+      }
+    },
+    _ => ()
+  }
 }
 
 #[cfg(test)]
@@ -142,19 +173,28 @@ mod tests {
       "::",
       "::1",
       "127.0.0.1",
+      "localhost",
       "[::1]",
       "1.2.3.4:5678",
       "0.0.0.0:5678",
       "127.0.0.1:5678",
+      "localhost:5678",
+      "127.0.0.1:5678",
+      "localhost:5678",
       "[::]:5678",
       "[::1]:5678",
       "localhost:5678",
+      "127.0.0.1:5678",
       "[::1]:8080",
       "[::]:8000",
       "[::1]:8000",
       "localhost:8000",
+      "127.0.0.1:8000",
       "0.0.0.0:4545",
       "127.0.0.1:4545",
+      "localhost:4545",
+      "127.0.0.1:4545",
+      "localhost:4545",
       "999.0.88.1:80"
     ];
     let actual = parse(entries).unwrap();
@@ -164,6 +204,30 @@ mod tests {
   #[test]
   fn parse_net_args_expansion() {
     let entries = svec![":8080"];
+    let expected = svec!["0.0.0.0:8080", "127.0.0.1:8080", "localhost:8080"];
+    let actual = parse(entries).unwrap();
+    assert_eq!(actual, expected);
+  }
+
+  #[test]
+  fn parse_net_args_special_host1() {
+    let entries = svec!["localhost:8080"];
+    let expected = svec!["localhost:8080", "127.0.0.1:8080"];
+    let actual = parse(entries).unwrap();
+    assert_eq!(actual, expected);
+  }
+
+  #[test]
+  fn parse_net_args_special_host2() {
+    let entries = svec!["127.0.0.1:8080"];
+    let expected = svec!["127.0.0.1:8080", "localhost:8080"];
+    let actual = parse(entries).unwrap();
+    assert_eq!(actual, expected);
+  }
+
+  #[test]
+  fn parse_net_args_special_host3() {
+    let entries = svec!["0.0.0.0:8080"];
     let expected = svec!["0.0.0.0:8080", "127.0.0.1:8080", "localhost:8080"];
     let actual = parse(entries).unwrap();
     assert_eq!(actual, expected);

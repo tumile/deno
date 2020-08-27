@@ -2218,7 +2218,7 @@ mod tests {
           script: "script.ts".to_string(),
         },
         allow_net: false,
-        net_allowlist: svec!["127.0.0.1"],
+        net_allowlist: svec!["127.0.0.1", "localhost"],
         ..Flags::default()
       }
     );
@@ -2808,6 +2808,7 @@ mod tests {
           "deno.land:80",
           "::",
           "127.0.0.1",
+          "localhost",
           "[::1]",
           "1.2.3.4:5678",
           "0.0.0.0:5678",
