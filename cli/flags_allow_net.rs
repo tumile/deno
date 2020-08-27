@@ -62,7 +62,7 @@ pub fn parse(paths: Vec<String>) -> clap::Result<Vec<String>> {
 }
 
 fn push_special_hosts(host_and_port: &str, out: &mut Vec<String>) {
-  let vec: Vec<&str> = host_and_port.split(":").collect();
+  let vec: Vec<&str> = host_and_port.split(':').collect();
   match vec[0] {
     "0.0.0.0" => {
       if vec.len() == 1 {
@@ -72,22 +72,22 @@ fn push_special_hosts(host_and_port: &str, out: &mut Vec<String>) {
         out.push(format!("127.0.0.1:{}", vec[1]));
         out.push(format!("localhost:{}", vec[1]));
       }
-    },
+    }
     "127.0.0.1" => {
       if vec.len() == 1 {
         out.push(String::from("localhost"));
       } else {
         out.push(format!("localhost:{}", vec[1]));
       }
-    },
+    }
     "localhost" => {
       if vec.len() == 1 {
         out.push(String::from("127.0.0.1"));
       } else {
         out.push(format!("127.0.0.1:{}", vec[1]));
       }
-    },
-    _ => ()
+    }
+    _ => (),
   }
 }
 
